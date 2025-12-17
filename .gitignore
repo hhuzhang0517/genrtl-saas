@@ -1,0 +1,16 @@
+node_modules/
+.next/
+dist/
+.vercel/
+*.log
+logs_result.json
+full_logs_webhook.json
+*.tsbuildinfo
+*.local
+*.env
+*.env.*
+/.idea
+/.vscode
+coverage/
+tmp/
+*.sqlite
