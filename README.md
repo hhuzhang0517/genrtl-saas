@@ -1,203 +1,139 @@
-# Monna-SaaS
+# genRTL
 
-## 项目概览
+# 简介
 
-这是一个开箱即用的 AI 图片/视频生成 SaaS 模板。  
-支持：Next.js App-Router + Supabase（Auth、Storage）+ Stripe 订阅 + Inngest 异步任务编排 + 多家 AI 提供商（OpenAI / Gemini / Ideogram） + CDN 加速。
+genRTL 后端是一套基于 genRTL-saas 模板构建的云端服务，负责整个自动 RTL 流程的在线推理和管理工作。它为客户端提供 HTTP API 接口，实现用户认证/订阅、任务调度、LLM 模型调用以及使用量计费等功能。后端将用户提交的设计 Spec 转化为具体实现方案与代码，通过 GPT-5.1 和 Claude 等大模型分工合作来生成结果，并对每次模型调用进行记录以支持计费。下文详细介绍后端各组件的架构设计，以及一次任务从接收 → 调度 → 推理 → 返回 → 计费的完整处理流程。
 
-用户在 Web 或原生 App 上发起生成请求 → 后端鉴权后触发 Inngest 异步任务 → 调第三方 API 生成 → 存储到 Supabase Storage（Smart CDN） → 更新任务状态并返回给前端。
+# 系统架构
 
+下图展示了 genRTL SaaS 后端的主要模块及其交互关系：
 
-## 功能说明
-AI图片和视频生成SaaS
-
-## 1) 对外输入/输出接口（面向 Web 与原生 App）
-## A. 认证与会话
-*OAuth2 授权端点（/oauth/ 或第三方托管）**：
-原生 App 使用外部浏览器 + Deep Link/自定义 URL Scheme 回跳，并强制 PKCE；这是 IETF 对“原生应用 OAuth”的最佳实践（RFC 8252）。
-会话/用户端点：GET /api/me、POST /api/auth/logout 等；返回用户资料、权限与订阅状态
-
-## B. 计费与钱包
-
-Web 订阅：POST /api/billing/checkout（Stripe Checkout/Portal URL）。
-
-移动端钱包支付（PaymentSheet）：
-
-POST /api/billing/payment-intent → 返回 client_secret，在 iOS/Android 端用 Stripe PaymentSheet（Apple Pay/Google Pay）完成收款
-Webhook（收款事件）：POST /api/webhooks/stripe，必须验签、处理重试、实现幂等
-
-## C. 生成任务 API（Web 与 App 复用）
-创建任务：POST /api/jobs（type=image|video, provider=openai|gemini|..., prompt, 可选参数）。
-要求客户端或服务端使用幂等键避免重复下单（HTTP 头 Idempotency-Key/自定义键）；做失败安全的重试
-查询任务：GET /api/jobs/{id}（status=queued|processing|done|failed, result_url）
-流式进度/结果（可选）：
-SSE 用于单向事件推送、生成进度；WebSocket用于双向协作/多人编辑。选择标准参考对比文档
-
-## D. 模型提供商接口（出站调用）
-OpenAI 图像生成（如 gpt-image-1，支持 URL 或 base64）与编辑/变体接口。
-Google Gemini 图像生成/Imagen（含 SynthID 水印 与地区可用性说明）。
-这些调用一般由后端 Worker 发起，并设置超时/重试/退避，结果落存储再回写任务表
-
-## E. 文件/媒体
-结果下载 URL：返回 签名 URL 或公开 CDN URL（带失效策略与缓存控制）。
-上传（若支持用户素材）：POST /api/uploads → 发回直传凭证/签名；客户端直传对象存储，降低后端带宽开销。
-
-## F. 可观测与健康检查
-健康探针：GET /healthz。
-指标/追踪：导出 OpenTelemetry（trace、metrics、logs）到采集器/后端。
-
-## G. 管理与合规
-管理 API：任务重试/取消、配额配置、审计查询。
-安全基线：遵循 OWASP API Security Top 10（2023版），覆盖鉴权、授权、资源滥用、速率限制、注入与敏感数据保护等。
-
-## 2) 一级功能模块与功能
-## 1、 API 网关 / BFF（Next.js Route Handlers 或任意后端框架）
-统一 HTTPS/JSON 接口，鉴权校验、参数校验、幂等键接入、错误规范。
-面向 Web 与原生 App 的同一套业务契约；下游调用编排/扇出。
-提供 SSE/WebSocket（视场景而定）
-## 2、 身份与访问控制（AuthN/AuthZ）
-基于 OAuth2/OIDC；原生 App 通过外部浏览器 + Deep Link 回调，启用 PKCE。
-会话管理（短期令牌 + 刷新）、角色/租户/资源级权限。
-
-## 3、计费与钱包（Billing）
-Stripe Checkout/Portal（Web 端订阅管理）；
-移动端用 PaymentSheet 拉起 Apple Pay/Google Pay；
-Webhook 事件驱动状态变更（订阅开通/续费/失败），签名校验 + 重试 + 幂等处理。
-货币与支付本地化，Checkout/Elements 自动按浏览器语言本地化 UI，并支持 135+ 货币；可用 Adaptive Pricing 自动计算本地价格
-
-## 4、任务编排与工作流（Orchestrator / Workers）
-负责把“创建任务 → 调用模型 → 落存储 → 回写状态 → 通知/SSE”串成可靠流水线。
-内建：并发控制、速率限制/节流、重试/退避、死信/补偿、定时清理。
-可选实现：Inngest/Temporal/Trigger.dev 或云原生队列与定时器（SQS/Cloud Tasks + Cron）
-
-## 5、 模型连接器（Provider Connectors）
-对 OpenAI / Gemini 等统一封装：超时、重试、限流、错误映射、审计日志；
-图像生成要点：OpenAI 的 Images/GPT-Image-1，Google 的 Gemini/Imagen（含 SynthID 水印）
-
-## 6、 媒体存储与 CDN
-对象存储（如 S3/Supabase Storage）保存结果，返回签名 URL；
-启用 CDN 与自动失效（例如 Supabase Smart CDN / CloudFront）；设置 Cache-Control、范围请求与大文件分段。
-
-## 7、数据持久层（DB）
-任务表：id, user_id, provider, type, status, result_url, created_at...；
-账单/额度表：订阅等级、配额、单价、用量；
-Webhook 事件幂等表：idempotency_key/事件 event_id 去重（参考 Stripe 做法）。
-
-## 8、Webhook 处理器
-Stripe Webhook：校验 Stripe-Signature，5 分钟窗口内验签，幂等更新订阅/发票状态；处理官方重试。
-模型/托管方回调（如有）：同样需要验签/白名单、防重放
-
-## 9、速率限制与配额
-按 用户/租户/端点 维度限流与计量；防止 资源过度消耗（OWASP API4:2023）。可在网关或工作流层做节流。
+graph LR
+    Client[客户端 Agent] -- 提交 Spec --> API[API 网关/服务器]
+    subgraph 后端服务
+        API -->|验证用户| Auth[Auth & Subscription<br/>认证与订阅]
+        API -->|触发任务| Dispatcher[Job Dispatcher<br/>(Inngest Workflow)]
+        Auth -- 订阅检查 --> API
+        Dispatcher --> PlanTask[Plan 步骤<br/>(GPT-5.1)]
+        Dispatcher --> CodeTask[Code 步骤<br/>(Claude)]
+        PlanTask -- 调用 --> GPT[GPT-5.1 模型 API]
+        CodeTask -- 调用 --> Claude[Claude 模型 API]
+        PlanTask -->|Plan 结果| CBB[CBB Registry<br/>模板库]
+        CBB -- 提供模板 --> CodeTask
+        CodeTask -->|代码 Patch| Result[结果缓冲]
+        Result -->|返回 Patch| API
+        Result -->|记录用量| UsageLedger[Usage Ledger<br/>使用记录]
+        UsageLedger --> Billing[Billing<br/>计费处理]
+        Dispatcher -. 可选调用 .-> CloudTool[云端 ToolRunner]
+    end
+    API -- Patch 响应 --> Client
+    classDef module fill:#f9f,stroke:#333;
+    classDef datastore fill:#bbf,stroke:#333;
+    Auth,Dispatcher,PlanTask,CodeTask,CBB,UsageLedger,Billing,CloudTool class module;
+    API,Result class datastore;
+    classDef external fill:#ffd,stroke:#333;
+    GPT,Claude class external;
 
 
-## 9、可观测性与审计
-全链路 OpenTelemetry：BFF→队列/工作流→连接器→存储；采集 trace、metrics、logs 到 OTel Collector/厂商后端，定位慢查询与失败重试链路。
-安全与合规日志：对登录、计费事件、模型调用参数做审计留痕。
+图：genRTL 后端架构 – 请求首先经过 API 网关，验证用户身份和订阅状态后，交由 Job Dispatcher（基于 Inngest 等工作流引擎）调度执行任务。Dispatcher 按照预定义的任务流程依次触发 Plan 步骤和 Code 步骤。其中 模型路由 逻辑确保 Plan 阶段调用 GPT-5.1 模型，Code 阶段调用 Claude 模型，各自完成规划和代码生成。Plan 结果可能需要从 CBB 模板库 检索复用的代码块供生成器参考。最终 Code 步骤产出代码 Patch 结果，通过 API 返回客户端。同时，每次模型调用的 Token 用量都会记录到 Usage Ledger（使用账本），供后续 Billing 模块计费使用。整个过程中还支持 云端 ToolRunner（可选）用于在云端执行 Lint/Sim 等验证任务，实现端到端全自动化。下面对各组件功能详述。
 
-## 10、 安全基线
-落实 OWASP API Security Top 10 (2023)：对象级授权（BOLA）、鉴权、属性级授权、输入验证、敏感数据保护、SSR 防护、资产清单、资源消耗 等。
-传输层：全链路 HTTPS、HSTS、安全响应头；
-接口级：幂等键、重放防护、签名校验、分页/排序白名单
+# 主要组件详解
+# Auth & Subscription（认证与订阅）
 
-## 11、 支持多语言
-前端 Web Next.js 内建 i18n 路由（域名或路径前缀）做语言切分与静态/服务端渲染，
+Auth 子系统负责用户身份验证和订阅管理：
 
+用户认证：提供用户注册、登录（支持 OAuth 第三方登录等）。API 网关在处理请求时会通过 Auth 模块验证客户端提供的令牌或 API 密钥是否合法，确定用户身份。
 
+订阅计划：管理用户的订阅等级（例如免费、专业版等）和有效期。对于需要计费的 API 调用或高端模型访问，Auth 模块检查用户是否有相应权限或剩余额度。
 
+访问控制：Auth 与 Usage Ledger 协同，可根据订阅策略限制用户的使用上限或调用频率。如免费用户超出额度则拒绝新任务或降级模型服务。
 
-## 系统架构
-## mermaid
+# Billing & Usage Ledger（计费与用量记录）
 
-flowchart LR
-subgraph Clients
-  WEB["Web Client"]
-  APP["Mobile App iOS Android"]
-  ADMIN_SUPER["Admin Console Super"]
-  ADMIN_TENANT["Admin Console Tenant"]
-end
+Billing/Usage 系统跟踪并记录每个用户的 AI 调用用量，以支持计费核算：
 
-subgraph API_BFF
-  GATE["API Gateway BFF"]
-  SSE["SSE or WebSocket Layer"]
-end
+Usage Ledger（用量日志）：每当后端调用一次 LLM 模型，都将记录用户ID、模型类型、消耗的 Token 数量、推理时长及估算成本等数据。这个“账本”累积了用户使用服务的历史，用于统计费用及后续分析
+javascript.plainenglish.io
+。
 
-subgraph Auth_RBAC
-  AUTH["Auth Service OAuth OIDC PKCE"]
-  RBAC["Authorization RBAC"]
-end
+计费策略：Billing 模块根据 Usage Ledger 的数据和用户订阅计划，周期性计算应收费金额或扣减预付代币。例如按月汇总 Token 使用量，超出订阅自带额度的部分按预定单价计费。也可以对接支付网关（如 Stripe）实现自动扣费和发票开具。
 
-subgraph Billing
-  BILL["Stripe Billing"]
-  WH["Stripe Webhook Receiver"]
-end
+用量查询：提供 API 或管理界面供用户查询自己的使用统计（例如本月用了多少 Token、花费多少费用），提高服务透明度。
 
-subgraph Orchestrator
-  FLOW["Workflow Orchestrator concurrency throttle retry cron"]
-end
+# 模型路由器（Model Router）
 
-subgraph Providers
-  OAI["Connector OpenAI"]
-  GEM["Connector Gemini"]
-  IDEO["Connector Ideogram"]
-end
+Model Router 模块负责对接多个大模型服务，并按任务阶段选择适当的模型：
 
-subgraph Analytics
-  GA4["Analytics GA4 Google tag"]
-  PH["Analytics PostHog events flags experiments"]
-end
+多模型支持：genRTL 后端同时接入 OpenAI 的 GPT-5.1 模型和 Anthropic 的 Claude 模型。Model Router 内部封装两者的 API 调用方法、密钥和参数配置。
 
-subgraph Data
-  DB["Database Jobs Users Tenants Quotas"]
-  STORE["Object Storage Results"]
-  CDN["CDN Signed URL"]
-end
+智能路由：根据任务性质决定调用哪种模型。设计上约定：Plan 阶段使用 GPT-5.1（擅长分析理解和规划任务），实现阶段使用 Claude（善于代码生成，支持更长上下文）
+javascript.plainenglish.io
+。Router 提供统一接口（例如 requestModel(service, prompt)），根据 service 参数选择对应模型并发送请求。
 
-subgraph Observability_Security
-  OTel["OpenTelemetry traces metrics logs"]
-  OWASP["OWASP API Security controls"]
-  RL["Rate Limit and Quota"]
-end
+错误处理与降级：Router 处理模型 API 的异常情况，如超时或配额限制。必要时对调用进行重试，或策略性降级（例如 GPT-5.1 不可用时暂时改用次优模型），以提高流程健壮性。
 
-WEB --> GATE
-APP --> GATE
-ADMIN_SUPER --> GATE
-ADMIN_TENANT --> GATE
+Prompt 管理：调用前，Router 根据阶段组装 Prompt。例如 Plan 阶段提供 Spec 文本并要求模型输出结构化计划；Code 阶段提供 Plan 结果、相关模板代码和格式要求（输出 unified diff）。Router 也可以在必要时对模型输出做格式校验或简单清理，然后再返回给 Dispatcher 的步骤函数使用。
 
-GATE --> AUTH
-GATE --> RBAC
-GATE --> BILL
-WH --> BILL
-WH --> DB
+# CBB Registry（模板库）
 
-GATE --> SSE
-GATE --> FLOW
-FLOW --> OAI
-FLOW --> GEM
-FLOW --> IDEO
+CBB Registry 是用于存储和检索常用 RTL 模块模板的服务：
 
-FLOW --> STORE
-STORE --> CDN
-FLOW --> DB
-GATE --> DB
-GATE --> STORE
+模板仓库：预先收录各类可复用的设计单元（如 FIFO 队列、ALU 运算单元、总线接口等），每个模板包含实现代码（Verilog/SystemVerilog）、参数化接口以及用途描述等元数据。
 
-GATE --> GA4
-GATE --> PH
+检索接口：提供根据关键词或功能描述搜索模板的 API。当 Plan 步骤输出的方案中涉及标准组件时，后端会调用 CBB Registry 查询匹配的模板。例如 Plan 识别需要一个 FIFO 队列模块，则 Dispatcher 在进入 Code 步骤前从 Registry 获取符合规格（如位宽、深度）且可实例化的 FIFO 模板代码片段。
 
-GATE --> RL
-GATE --> OTel
-FLOW --> OTel
-WH --> OTel
+模板实例化：Registry 不但提供代码，还支持模板实例化操作——对于带参数的模板，后端可指定参数值生成特定配置的代码实例。Code 步骤中的 Claude 模型在生成代码时，可直接利用这些模板代码，避免重复造轮子，提高代码正确性。
 
+动态扩展：CBB 模板库可以由开发团队持续扩充，并通过标签、嵌入向量等方式实现更智能的检索。将来 Plan 模型也可参考此库（例如检索与当前 Spec 相似的设计范例）以优化输出。
 
+# Job Dispatcher（任务调度器）
 
----
+Job Dispatcher 是后端执行多步骤任务的核心，采用类似 Inngest 的事件驱动工作流引擎
+javascript.plainenglish.io
+：
 
-## ​ 快速开始（本地开发）
+事件触发：当 API 接收到用户提交的 Spec 请求后，会向 Dispatcher 发送一个事件（如 “DesignJobRequested”），包含任务 ID、用户 ID 和 Spec 内容等数据。Dispatcher 监听该事件并启动对应的工作流。
 
-1. 克隆并安装依赖：
-   ```bash
-   git clone <repo-url>
-   cd monna-saas
-   pnpm install
+步骤编排：工作流定义为一系列函数步骤，每个步骤完成特定子任务。对于自动 RTL 任务，主要步骤包括：Plan 设计规划、（可选）模板检索、Code 代码生成，以及后续结果处理。Dispatcher 确保这些步骤按顺序执行，前一步的输出作为后一步的输入。
+
+可靠执行：工作流各步骤在云端异步执行，互相解耦。若某步骤失败（例如模型调用超时），Inngest 框架会自动重试该步骤，并保留之前成功步骤的状态
+javascript.plainenglish.io
+。这意味着整个任务具备容错性，可在中断后从上次成功点恢复继续。
+
+并发与限流：Dispatcher 可以控制任务并发数和速率限制。例如限制同一用户同时运行的任务数量，防止滥用。也记录每次任务的执行时间和结果状态，便于监控和调优。
+
+任务类型扩展：除了 Spec→Code 完整流程，Dispatcher 还能管理其他类型的任务（如仅代码优化、错误分析等）。通过定义不同事件和步骤序列，即可扩展出不同的自动化流程。
+
+# 任务处理流程
+
+genRTL 后端从接受任务请求到返回结果，会经历一系列步骤。以下流程图描述了一次 Spec 任务在后端的处理与流转，以及计费记录的过程（genRTL 后端任务流）：
+
+flowchart TD
+    U[用户/客户端] -->|提交 Spec 请求| RAPI[后端 API 网关]
+    RAPI -->|Auth 验证| AuthCheck{{订阅有效?}}
+    AuthCheck -- 否 --> Deny[请求拒绝<br/>返回错误]
+    AuthCheck -- 是 --> Trigger[触发 Inngest 工作流]
+    Trigger --> PlanFn[步骤1: 调用 GPT-5.1 生成 Plan]
+    PlanFn --> PlanOut[Plan 输出]
+    PlanOut -->|检索模板| TemplateStep[步骤2: 查询 CBB 模板库]
+    TemplateStep --> Templates[匹配到的模板代码]
+    Templates --> CodeFn[步骤3: 调用 Claude 生成代码]
+    PlanOut --> CodeFn
+    CodeFn --> PatchResult[生成 Patch 补丁]
+    PatchResult -->|记录 token 用量| UsageLog[Usage Ledger 写入]
+    UsageLog --> BillingProc[计费处理]
+    PatchResult --> Return[准备返回结果]
+    Return -->|HTTP 响应 Patch| U
+
+任务请求：用户在客户端发起 Spec 提交请求，由后端 API 接收。首先进行用户认证及订阅状态检查。如果未通过（如未登录或订阅无效），则拒绝请求并返回错误信息。
+工作流触发：通过 Job Dispatcher（如 Inngest）创建一个异步任务工作流来处理该 Spec。这样即使流程较长也不会阻塞 HTTP 请求线程（可选择立即返回任务 ID，或由客户端轮询/回调获取结果）。
+
+步骤1 – 生成 Plan：工作流第一步调用 GPT-5.1 模型，根据 Spec 生成实现计划。Prompt 中包含用户的规格描述，要求模型输出结构化的设计方案（例如模块列表、接口定义、验证思路等）。GPT-5.1 返回 Plan 结果，格式可以是条列要点或 JSON 结构，供后续步骤解析使用。
+
+步骤2 – 模板检索：根据 Plan 内容，确定是否需要引入已有模板。如果 Plan 提到使用某些标准模块，则此步骤调用 CBB 模板库搜索匹配的实现，将得到的模板代码或参数提供给下一步。如 Plan 指明需要一个 FIFO 队列，则检索相应 FIFO 模板代码（如参数化的深度、位宽），准备给代码生成步骤参考。
+
+步骤3 – 生成代码：调用 Claude 模型完成功能代码实现。Prompt 包括：Plan 细节、（可选）引入的模板代码片段，以及对输出格式的要求（例如使用 Unified Diff 输出代码改动）。Claude 利用其编程能力产出满足 Spec 的 RTL 代码，通常以 diff 补丁形式描述对各文件的修改和新增内容。生成结果暂存为 Patch 文本。
+
+结果返回：当工作流完成后，后端将最终 Patch 结果通过 API 返回给客户端 Agent。客户端据此应用代码改动并进入本地验证环节。如果采用异步模式，API 可在任务完成时通过事件或轮询让客户端获取结果。
+
+用量记录与计费：在模型调用完成后，后端记录此次任务中各模型调用的 Token 数量和成本到 Usage Ledger 中。例如 GPT-5.1 使用了 N 个 Token，Claude 使用了 M 个 Token，每条记录包含模型名称和对应费用。Billing 模块据此更新用户的使用量统计，按照计费周期汇总扣费或提示用户升级订阅。每次 AI 推理的详细用量都有据可查，支持后续账单结算和系统监控。
